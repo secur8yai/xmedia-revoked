@@ -1,0 +1,185 @@
+# XMedia production stack — Postgres + XMedia, hardened for the 90% host claim.
+#
+# Phase 40 changes vs prior:
+#   - Memory limit defaults to 14g (16 GB host minus 1 GB OS reservation +
+#     headroom). install.sh auto-detects host RAM and overrides via .env.
+#   - GOMEMLIMIT explicitly tells the Go runtime to keep its heap inside the
+#     cgroup limit — without this the GC has no idea the cgroup exists and
+#     can grow past it, triggering kernel OOM-kill.
+#   - ulimits raised to 65535 so the NZB engine can hold ~20 NNTP streams
+#     plus the torrent peer connections without exhausting fds.
+#   - cap_drop ALL + cap_add NET_BIND_SERVICE + no-new-privileges = least
+#     privilege; the binary cannot escalate inside its container.
+#
+# NETWORKING:
+#   Default = bridge network with port mapping (works on Docker Desktop,
+#   restricted environments, and rootless setups). Postgres lives only on
+#   the internal `xmedia` bridge — never reachable from the host.
+#
+#   For the best BitTorrent peer discovery (DHT/PEX/LSD/UPnP), operators on
+#   dedicated Linux hosts can switch xmedia to `network_mode: host` — see
+#   docs/dev/docker.md for the exact change. Phase 40 ships bridge networking
+#   as the default because it's compatible with every Docker install.
+#
+# SECURITY: copy `.env.example` to `.env` and set strong values for
+#   POSTGRES_PASSWORD, XMEDIA_VAULT_PASSPHRASE, XMEDIA_BOOTSTRAP_ADMIN_PASSWORD
+# before starting. The defaults in this file are placeholders — do NOT
+# expose port ${XMEDIA_HTTP_HOST_PORT:-8080} to the public internet while using them.
+#
+# Quickstart:
+#   curl -fsSL https://github.com/secur8yai/xmedia/releases/latest/download/install.sh | sudo bash
+# (install.sh detects host resources and writes .env automatically.)
+#
+# Manual:
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d
+#   curl -f http://localhost:8000/api/v1/health/ready
+services:
+  postgres:
+    image: postgres:16.8-alpine
+    container_name: xmedia-prod-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xmedia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xmedia_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-xmedia}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xmedia} -d ${POSTGRES_DB:-xmedia}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - xmedia
+
+  xmedia:
+    image: ${XMEDIA_IMAGE:-ghcr.io/secur8yai/xmedia:latest}
+    container_name: xmedia-prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # ─── 90% host-RAM claim (install.sh writes XMEDIA_MEMORY_LIMIT) ────────
+    # Defaults assume a 16 GB host with 1 GB reserved for OS. install.sh
+    # detects the actual host RAM and rewrites these in .env.
+    deploy:
+      resources:
+        limits:
+          memory: ${XMEDIA_MEMORY_LIMIT:-14g}
+          cpus: "${XMEDIA_CPU_LIMIT:-0}"
+        reservations:
+          memory: 1g
+    mem_swappiness: 10
+
+    # ─── File descriptors / threads ────────────────────────────────────────
+    # NZB pipeline holds up to 20 streams per provider plus torrent peer
+    # connections — 65535 fds is the safe ceiling.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc: 8192
+
+    # ─── Networking (bridge by default; see docs/dev/docker.md for host) ──
+    ports:
+      - "${XMEDIA_HTTP_HOST_PORT:-8080}:8000"
+      # Optional: expose torrent peer port if you've port-forwarded it on the
+      # router for inbound peer connections. Outbound + DHT work without it.
+      # - "${XMEDIA_TORRENT_PORT:-6881}:6881"
+      # - "${XMEDIA_TORRENT_PORT:-6881}:6881/udp"
+
+    # ─── Capabilities (least privilege) ────────────────────────────────────
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+    # ─── Storage ───────────────────────────────────────────────────────────
+    volumes:
+      - ${XMEDIA_DATA:-./data}:/data
+      - ${XMEDIA_CONFIG:-./config}:/config
+
+    environment:
+      # Server
+      XMEDIA_SERVER_HOST: "0.0.0.0"
+      XMEDIA_SERVER_PORT: "8000"
+
+      # Database
+      XMEDIA_DATABASE_HOST: postgres
+      XMEDIA_DATABASE_PORT: "5432"
+      XMEDIA_DATABASE_SSLMODE: "disable"
+      XMEDIA_DATABASE_USER: ${POSTGRES_USER:-xmedia}
+      XMEDIA_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-xmedia_secret}
+      XMEDIA_DATABASE_DATABASE: ${POSTGRES_DB:-xmedia}
+
+      # Storage paths inside the container
+      XMEDIA_DOWNLOAD_DOWNLOAD_DIR: "/data/downloads"
+      XMEDIA_DOWNLOAD_DATA_DIR: "/data/xmedia"
+      XMEDIA_VAULT_KEY_PATH: "/config/vault.key"
+      XMEDIA_VAULT_SALT_PATH: "/config/vault.salt"
+      XMEDIA_VAULT_PASSPHRASE: ${XMEDIA_VAULT_PASSPHRASE:-}
+
+      # Argon2id cost overrides (vault key derivation). Default is the
+      # v0.7.x legacy 64 GiB memory cost — preserved so existing prod
+      # vaults stay decryptable. New installs on right-sized hosts can
+      # set XMEDIA_VAULT_ARGON2_MEMORY_KIB=65536 (64 MiB, OWASP) in .env.
+      # Smoke / CI runners override here to fit inside a 2 GB cgroup.
+      XMEDIA_VAULT_ARGON2_MEMORY_KIB: ${XMEDIA_VAULT_ARGON2_MEMORY_KIB:-}
+      XMEDIA_VAULT_ARGON2_TIME: ${XMEDIA_VAULT_ARGON2_TIME:-}
+      XMEDIA_VAULT_ARGON2_THREADS: ${XMEDIA_VAULT_ARGON2_THREADS:-}
+
+      # Bootstrap admin
+      XMEDIA_BOOTSTRAP_ADMIN_USERNAME: ${XMEDIA_BOOTSTRAP_ADMIN_USERNAME:-}
+      XMEDIA_BOOTSTRAP_ADMIN_PASSWORD: ${XMEDIA_BOOTSTRAP_ADMIN_PASSWORD:-}
+      XMEDIA_BOOTSTRAP_ADMIN_DISPLAY_NAME: ${XMEDIA_BOOTSTRAP_ADMIN_DISPLAY_NAME:-}
+
+      # Runtime
+      XMEDIA_PROFILE: ${XMEDIA_PROFILE:-production}
+      XMEDIA_LOG_LEVEL: "info"
+      XMEDIA_LOG_FORMAT: "json"
+
+      # Go runtime — keep heap inside the cgroup limit so the kernel
+      # doesn't OOM-kill us. install.sh writes this at 90% of MEMORY_LIMIT.
+      GOMEMLIMIT: ${XMEDIA_GOMEMLIMIT:-13GiB}
+      # Use all available CPU threads visible to the container; respects
+      # cpus limit if one is set.
+      GOMAXPROCS: ${XMEDIA_GOMAXPROCS:-0}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/xmedia", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - xmedia
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  xmedia:
+    name: xmedia-prod
